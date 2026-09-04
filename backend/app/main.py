@@ -98,7 +98,8 @@ class PostgresConnection:
         return self.connection.execute(self._query(query), parameters)
 
     def executemany(self, query: str, parameters: Any):
-        return self.connection.executemany(self._query(query), parameters)
+        for parameter_set in parameters:
+            self.connection.execute(self._query(query), parameter_set)
 
 
 def db() -> Any:
