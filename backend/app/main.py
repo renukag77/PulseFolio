@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = Path(os.getenv("DATABASE_PATH", str(ROOT / "pulsefolio.db")))
 JWT_SECRET = os.getenv("JWT_SECRET", "local-development-secret-change-me")
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:8080")
+FRONTEND_ORIGINS = [origin.strip().rstrip("/") for origin in FRONTEND_ORIGIN.split(",") if origin.strip()]
 
 ASSET_TYPES = {"stock", "mf", "gold", "debt"}
 TARGET_MIX = {"stock": 0.60, "mf": 0.0, "gold": 0.10, "debt": 0.30}
@@ -378,7 +379,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="PulseFolio API", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=[FRONTEND_ORIGIN, "http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=FRONTEND_ORIGINS + ["http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/health")
@@ -439,13 +440,23 @@ async def import_csv(file: UploadFile = File(...), user_id: int = Depends(curren
         records = list(csv.DictReader(decoded.splitlines(), dialect=dialect))
     except (UnicodeDecodeError, csv.Error) as error:
         raise HTTPException(status_code=400, detail="CSV must be UTF-8 with ticker, asset_type, quantity, and buy_price columns") from error
-    created = []
+    payloads: list[HoldingPayload] = []
     for record in records:
         try:
             normalized = {str(key).strip().lower(): (value.strip() if isinstance(value, str) else value) for key, value in record.items() if key is not None}
-            created.append(create_holding(HoldingPayload(ticker=normalized["ticker"], asset_type=normalized["asset_type"], quantity=float(normalized["quantity"]), buy_price=float(normalized["buy_price"])), user_id))
-        except (KeyError, ValueError) as error:
+            payloads.append(HoldingPayload(ticker=normalized["ticker"], asset_type=normalized["asset_type"], quantity=float(normalized["quantity"]), buy_price=float(normalized["buy_price"])))
+        except (KeyError, TypeError, ValueError) as error:
             raise HTTPException(status_code=400, detail="Each CSV row needs ticker, asset_type, quantity, and buy_price") from error
+    created = []
+    with db() as connection:
+        for payload in payloads:
+            ticker = payload.ticker.strip().upper()
+            asset_type = payload.asset_type.lower()
+            if asset_type not in ASSET_TYPES:
+                raise HTTPException(status_code=422, detail="asset_type must be stock, mf, gold, or debt")
+            name, sector = DEFAULTS.get(ticker, (ticker, "Other"))
+            cursor = connection.execute("INSERT INTO holdings (user_id, ticker, name, asset_type, sector, quantity, buy_price, last_price, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (user_id, ticker, name, asset_type, sector, payload.quantity, payload.buy_price, price_for(ticker, payload.buy_price), now()))
+            created.append(holding_json(connection.execute("SELECT * FROM holdings WHERE id = ?", (cursor.lastrowid,)).fetchone()))
     return created
 
 

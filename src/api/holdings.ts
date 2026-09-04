@@ -18,8 +18,6 @@ export async function deleteHolding(id: Holding["id"]): Promise<void> {
 export async function importHoldingsCsv(file: File): Promise<Holding[]> {
   const form = new FormData();
   form.append("file", file);
-  const { data } = await api.post<Holding[]>("/holdings/import-csv", form, {
-    headers: { "Content-Type": "multipart/form-data" },
-  });
+  const { data } = await api.post<Holding[]>("/holdings/import-csv", form);
   return data;
 }
