@@ -81,7 +81,7 @@ function HoldingsPage() {
     <AppShell>
       <h1 className="text-2xl font-semibold tracking-tight">Holdings</h1>
       <p className="mt-1 text-sm text-muted-foreground">
-        Add positions one by one, or import a CSV with ticker, asset_type, quantity, buy_price.
+        Add positions one by one, or import a CSV/TSV with ticker, asset_type, quantity, buy_price.
       </p>
 
       <div className="mt-6 grid gap-5 lg:grid-cols-3">
@@ -170,11 +170,11 @@ function HoldingsPage() {
                 <Upload className="mx-auto size-5 text-primary" />
               )}
               <p className="mt-2 text-sm font-medium">Import CSV</p>
-              <p className="text-xs text-muted-foreground">Drag &amp; drop a file, or click to browse</p>
+              <p className="text-xs text-muted-foreground">CSV or TSV · drag &amp; drop, or click to browse</p>
               <input
                 ref={fileInput}
                 type="file"
-                accept=".csv,text/csv"
+                accept=".csv,.tsv,text/csv,text/tab-separated-values"
                 className="hidden"
                 onChange={(e) => handleFiles(e.target.files)}
               />

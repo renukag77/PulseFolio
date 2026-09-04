@@ -78,3 +78,45 @@ export type LiveMessage =
       type: "alert_triggered";
       payload: { ticker?: string; threshold_price?: number; direction?: AlertDirection; message?: string };
     };
+
+export interface WatchlistState {
+  ticker: string;
+  price: number;
+  volume: number;
+  avg_volume: number;
+  volatility_5d: number;
+  volatility_30d: number;
+  fifty_two_week_high: number;
+  fifty_two_week_low: number;
+  updated_at: string;
+  is_stale: boolean;
+}
+
+export interface WatchlistItem {
+  id: number | string;
+  user_id?: number | string;
+  ticker: string;
+  added_at: string;
+  state: WatchlistState;
+}
+
+export interface WatchlistDigestItem extends WatchlistState {
+  id: number | string;
+  attention_score: number;
+  changes: string[];
+  freshness_seconds: number;
+  change_pct: number;
+  z_score: number;
+  volume_ratio: number;
+  sparkline: number[];
+}
+
+export interface WatchlistDigest {
+  items: WatchlistDigestItem[];
+  last_viewed_at: string;
+}
+
+export type WatchlistLiveMessage = {
+  type: "ticker_update";
+  payload: Pick<WatchlistState, "ticker" | "price" | "volume" | "updated_at" | "is_stale">;
+};

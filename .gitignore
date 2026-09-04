@@ -13,6 +13,8 @@ dist-ssr
 *.local
 backend/.venv
 backend/*.db
+__pycache__
+*.py[cod]
 
 # Logs and OS/editor files
 logs

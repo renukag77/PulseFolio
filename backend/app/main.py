@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import csv
 import hashlib
 import hmac
@@ -10,6 +11,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +43,7 @@ DEFAULTS = {
 security = HTTPBearer(auto_error=False)
 connections: set[WebSocket] = set()
 connections_lock = threading.Lock()
+watch_connections: dict[WebSocket, int] = {}
 
 
 class AuthPayload(BaseModel):
@@ -59,6 +62,10 @@ class AlertPayload(BaseModel):
     holding_id: int
     threshold_price: float = Field(gt=0)
     direction: str
+
+
+class WatchlistPayload(BaseModel):
+    ticker: str = Field(min_length=1, max_length=24)
 
 
 def now() -> str:
@@ -103,6 +110,41 @@ def init_db() -> None:
                 direction TEXT NOT NULL,
                 is_triggered INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS watchlist_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                ticker TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                UNIQUE(user_id, ticker)
+            );
+            CREATE TABLE IF NOT EXISTS ticker_state (
+                ticker TEXT PRIMARY KEY,
+                price REAL NOT NULL,
+                volume REAL NOT NULL,
+                avg_volume REAL NOT NULL,
+                volatility_5d REAL NOT NULL,
+                volatility_30d REAL NOT NULL,
+                fifty_two_week_high REAL NOT NULL,
+                fifty_two_week_low REAL NOT NULL,
+                updated_at TEXT NOT NULL,
+                is_stale INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS user_snapshots (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                ticker TEXT NOT NULL,
+                price_at_snapshot REAL NOT NULL,
+                volume_at_snapshot REAL NOT NULL,
+                volatility_at_snapshot REAL NOT NULL,
+                snapshot_taken_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, ticker)
+            );
+            CREATE TABLE IF NOT EXISTS change_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                change_type TEXT NOT NULL,
+                magnitude REAL NOT NULL,
+                detected_at TEXT NOT NULL
             );
             """
         )
@@ -152,6 +194,78 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(secu
 
 def price_for(ticker: str, fallback: float) -> float:
     return PRICE_BASES.get(ticker.upper(), fallback)
+
+
+def ensure_ticker_state(connection: sqlite3.Connection, ticker: str) -> sqlite3.Row:
+    row = connection.execute("SELECT * FROM ticker_state WHERE ticker = ?", (ticker,)).fetchone()
+    if row is None:
+        price = price_for(ticker, 100.0)
+        connection.execute(
+            "INSERT INTO ticker_state (ticker, price, volume, avg_volume, volatility_5d, volatility_30d, fifty_two_week_high, fifty_two_week_low, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ticker, price, 1_000_000, 1_000_000, 1.8, 2.4, round(price * 1.15, 2), round(price * 0.85, 2), now()),
+        )
+        row = connection.execute("SELECT * FROM ticker_state WHERE ticker = ?", (ticker,)).fetchone()
+    return row
+
+
+def ticker_json(row: sqlite3.Row) -> dict[str, Any]:
+    payload = dict(row)
+    payload["is_stale"] = bool(payload["is_stale"])
+    return payload
+
+
+def sparkline_for(ticker: str, price: float) -> list[float]:
+    seed = sum(ord(character) for character in ticker)
+    return [round(price * (1 + (((seed + index * 17) % 31) - 15) / 1000), 2) for index in range(30)]
+
+
+def watchlist_item_json(row: sqlite3.Row) -> dict[str, Any]:
+    return dict(row)
+
+
+def digest_item(connection: sqlite3.Connection, user_id: int, item: sqlite3.Row) -> tuple[dict[str, Any], dict[str, float]]:
+    state = ensure_ticker_state(connection, item["ticker"])
+    snapshot = connection.execute(
+        "SELECT * FROM user_snapshots WHERE user_id = ? AND ticker = ?", (user_id, item["ticker"])
+    ).fetchone()
+    current = ticker_json(state)
+    changes: list[str] = []
+    score = 0.0
+    move_pct = 0.0
+    z_score = 0.0
+    volume_ratio = current["volume"] / max(current["avg_volume"], 1)
+    regime_ratio = current["volatility_5d"] / max(current["volatility_30d"], 0.1)
+    if snapshot:
+        previous_price = snapshot["price_at_snapshot"]
+        move_pct = ((current["price"] - previous_price) / previous_price) * 100 if previous_price else 0
+        z_score = move_pct / max(current["volatility_30d"], 0.1)
+        if abs(z_score) > 1.5:
+            changes.append(f"{'Up' if move_pct >= 0 else 'Down'} {abs(move_pct):.2f}% — {abs(z_score):.1f}x its usual daily move")
+            score += min(abs(z_score) * 25, 55)
+        if volume_ratio > 2:
+            changes.append(f"Volume {volume_ratio:.1f}x above average")
+            score += min((volume_ratio - 1) * 12, 25)
+        if regime_ratio > 1.5 or regime_ratio < 0.67:
+            changes.append(f"Volatility regime shifted to {regime_ratio:.1f}x its 30-day level")
+            score += 12
+        breached = current["price"] >= current["fifty_two_week_high"] or current["price"] <= current["fifty_two_week_low"]
+        if breached:
+            changes.append("Price breached its tracked 52-week range")
+            score += 20
+    else:
+        changes.append("Newly added — baseline captured on this visit")
+    age = max(0, int(time.time() - datetime.fromisoformat(current["updated_at"]).timestamp()))
+    return {
+        **current,
+        "id": item["id"],
+        "attention_score": round(min(score, 100), 1),
+        "changes": changes,
+        "freshness_seconds": age,
+        "change_pct": round(move_pct, 2),
+        "z_score": round(z_score, 2),
+        "volume_ratio": round(volume_ratio, 2),
+        "sparkline": sparkline_for(item["ticker"], current["price"]),
+    }, {"price": current["price"], "volume": current["volume"], "volatility": current["volatility_30d"]}
 
 
 def holding_json(row: sqlite3.Row) -> dict[str, Any]:
@@ -214,15 +328,44 @@ async def broadcast(message: dict[str, Any]) -> None:
             connections.discard(socket)
 
 
+async def broadcast_watchlist(ticker: str, payload: dict[str, Any]) -> None:
+    stale: list[WebSocket] = []
+    with connections_lock:
+        sockets = list(watch_connections.items())
+    for socket, user_id in sockets:
+        with db() as connection:
+            watching = connection.execute(
+                "SELECT 1 FROM watchlist_items WHERE user_id = ? AND ticker = ?", (user_id, ticker)
+            ).fetchone()
+        if watching:
+            try:
+                await socket.send_json({"type": "ticker_update", "payload": payload})
+            except Exception:
+                stale.append(socket)
+    with connections_lock:
+        for socket in stale:
+            watch_connections.pop(socket, None)
+
+
 async def price_loop() -> None:
     while True:
-        await __import__("asyncio").sleep(30)
+        await asyncio.sleep(30)
         with db() as connection:
             rows = connection.execute("SELECT id, ticker, last_price FROM holdings").fetchall()
             for row in rows:
                 updated = round(row["last_price"] * (1 + secrets.choice([-1, 1]) * secrets.randbelow(8) / 10_000), 2)
                 connection.execute("UPDATE holdings SET last_price = ? WHERE id = ?", (updated, row["id"]))
                 await broadcast({"type": "price_update", "payload": {"ticker": row["ticker"], "last_price": updated}})
+            tickers = connection.execute("SELECT DISTINCT ticker FROM watchlist_items").fetchall()
+            for ticker_row in tickers:
+                state = ensure_ticker_state(connection, ticker_row["ticker"])
+                updated = round(state["price"] * (1 + secrets.choice([-1, 1]) * secrets.randbelow(20) / 10_000), 2)
+                volume = round(state["avg_volume"] * (1 + secrets.randbelow(250) / 100), 0)
+                connection.execute(
+                    "UPDATE ticker_state SET price = ?, volume = ?, updated_at = ?, is_stale = 0 WHERE ticker = ?",
+                    (updated, volume, now(), ticker_row["ticker"]),
+                )
+                await broadcast_watchlist(ticker_row["ticker"], {"ticker": ticker_row["ticker"], "price": updated, "volume": volume, "updated_at": now(), "is_stale": False})
 
 
 @asynccontextmanager
@@ -291,13 +434,16 @@ def create_holding(payload: HoldingPayload, user_id: int = Depends(current_user)
 async def import_csv(file: UploadFile = File(...), user_id: int = Depends(current_user)) -> list[dict[str, Any]]:
     raw = await file.read()
     try:
-        records = list(csv.DictReader(raw.decode("utf-8-sig").splitlines()))
+        decoded = raw.decode("utf-8-sig")
+        dialect = csv.Sniffer().sniff(decoded[:4096], delimiters=",\t;")
+        records = list(csv.DictReader(decoded.splitlines(), dialect=dialect))
     except (UnicodeDecodeError, csv.Error) as error:
         raise HTTPException(status_code=400, detail="CSV must be UTF-8 with ticker, asset_type, quantity, and buy_price columns") from error
     created = []
     for record in records:
         try:
-            created.append(create_holding(HoldingPayload(ticker=record["ticker"], asset_type=record["asset_type"], quantity=float(record["quantity"]), buy_price=float(record["buy_price"])), user_id))
+            normalized = {str(key).strip().lower(): (value.strip() if isinstance(value, str) else value) for key, value in record.items() if key is not None}
+            created.append(create_holding(HoldingPayload(ticker=normalized["ticker"], asset_type=normalized["asset_type"], quantity=float(normalized["quantity"]), buy_price=float(normalized["buy_price"])), user_id))
         except (KeyError, ValueError) as error:
             raise HTTPException(status_code=400, detail="Each CSV row needs ticker, asset_type, quantity, and buy_price") from error
     return created
@@ -353,6 +499,63 @@ def delete_alert(alert_id: int, user_id: int = Depends(current_user)) -> None:
         raise HTTPException(status_code=404, detail="Alert not found")
 
 
+@app.get("/watchlist")
+def list_watchlist(user_id: int = Depends(current_user)) -> list[dict[str, Any]]:
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT id, user_id, ticker, added_at FROM watchlist_items WHERE user_id = ? ORDER BY added_at DESC",
+            (user_id,),
+        ).fetchall()
+        return [{**watchlist_item_json(row), "state": ticker_json(ensure_ticker_state(connection, row["ticker"]))} for row in rows]
+
+
+@app.post("/watchlist")
+def add_watchlist_item(payload: WatchlistPayload, user_id: int = Depends(current_user)) -> dict[str, Any]:
+    ticker = payload.ticker.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]{0,23}", ticker):
+        raise HTTPException(status_code=422, detail="Enter a valid ticker symbol")
+    with db() as connection:
+        ensure_ticker_state(connection, ticker)
+        try:
+            cursor = connection.execute(
+                "INSERT INTO watchlist_items (user_id, ticker, added_at) VALUES (?, ?, ?)",
+                (user_id, ticker, now()),
+            )
+        except sqlite3.IntegrityError as error:
+            raise HTTPException(status_code=409, detail="That ticker is already on your watchlist") from error
+        row = connection.execute("SELECT id, user_id, ticker, added_at FROM watchlist_items WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return {**watchlist_item_json(row), "state": ticker_json(ensure_ticker_state(connection, ticker))}
+
+
+@app.delete("/watchlist/{item_id}", status_code=204, response_model=None)
+def delete_watchlist_item(item_id: int, user_id: int = Depends(current_user)) -> None:
+    with db() as connection:
+        result = connection.execute("DELETE FROM watchlist_items WHERE id = ? AND user_id = ?", (item_id, user_id))
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Watchlist item not found")
+
+
+@app.get("/watchlist/digest")
+def watchlist_digest(user_id: int = Depends(current_user)) -> dict[str, Any]:
+    with db() as connection:
+        items = connection.execute(
+            "SELECT id, user_id, ticker, added_at FROM watchlist_items WHERE user_id = ? ORDER BY added_at DESC",
+            (user_id,),
+        ).fetchall()
+        digest: list[dict[str, Any]] = []
+        snapshots: list[tuple[int, str, float, float, float, str]] = []
+        for item in items:
+            current, snapshot_values = digest_item(connection, user_id, item)
+            digest.append(current)
+            snapshots.append((user_id, item["ticker"], snapshot_values["price"], snapshot_values["volume"], snapshot_values["volatility"], now()))
+        connection.executemany(
+            "INSERT INTO user_snapshots (user_id, ticker, price_at_snapshot, volume_at_snapshot, volatility_at_snapshot, snapshot_taken_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, ticker) DO UPDATE SET price_at_snapshot = excluded.price_at_snapshot, volume_at_snapshot = excluded.volume_at_snapshot, volatility_at_snapshot = excluded.volatility_at_snapshot, snapshot_taken_at = excluded.snapshot_taken_at",
+            snapshots,
+        )
+    digest.sort(key=lambda item: item["attention_score"], reverse=True)
+    return {"items": digest, "last_viewed_at": now()}
+
+
 @app.websocket("/ws/live")
 async def live_socket(websocket: WebSocket) -> None:
     token = websocket.query_params.get("token")
@@ -373,3 +576,25 @@ async def live_socket(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         with connections_lock:
             connections.discard(websocket)
+
+
+@app.websocket("/ws/watchlist")
+async def watchlist_socket(websocket: WebSocket) -> None:
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=1008)
+        return
+    try:
+        user_id = user_from_token(token)
+    except HTTPException:
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    with connections_lock:
+        watch_connections[websocket] = user_id
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        with connections_lock:
+            watch_connections.pop(websocket, None)
