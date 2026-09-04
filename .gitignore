@@ -1,0 +1,26 @@
+# Dependencies and build output
+node_modules
+dist
+dist-ssr
+.output
+.vinxi
+.tanstack
+.nitro
+.wrangler
+
+# Local configuration and generated backend data
+.env
+*.local
+backend/.venv
+backend/*.db
+
+# Logs and OS/editor files
+logs
+*.log
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# Cloudflare local state
+.dev.vars
