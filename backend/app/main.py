@@ -243,6 +243,11 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/")
+def root() -> dict[str, str]:
+    return {"name": "PulseFolio API", "status": "ok", "health": "/health"}
+
+
 @app.post("/auth/signup")
 def signup(payload: AuthPayload) -> dict[str, str]:
     with db() as connection:
