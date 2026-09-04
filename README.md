@@ -123,7 +123,9 @@ headers on WebSocket handshakes) and auto-reconnects every 5s after a drop.
 
 For deployment, set `JWT_SECRET`, `DATABASE_PATH`, and `FRONTEND_ORIGIN` from
 `backend/.env.example` on the backend host. The included SQLite setup is intended for local
-development; use PostgreSQL for a multi-instance production deployment.
+development. For hosted deployment, set `DATABASE_URL` to your Neon PostgreSQL connection string
+and leave `DATABASE_PATH` unused; the backend creates the required tables on startup. Never commit
+the connection string to GitHub.
 
 ## Folder structure
 

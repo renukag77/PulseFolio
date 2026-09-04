@@ -21,9 +21,12 @@ from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
+import psycopg
+from psycopg.rows import dict_row
 
 ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = Path(os.getenv("DATABASE_PATH", str(ROOT / "pulsefolio.db")))
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 JWT_SECRET = os.getenv("JWT_SECRET", "local-development-secret-change-me")
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:8080")
 FRONTEND_ORIGINS = [origin.strip().rstrip("/") for origin in FRONTEND_ORIGIN.split(",") if origin.strip()]
@@ -73,7 +76,34 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def db() -> sqlite3.Connection:
+class PostgresConnection:
+    def __init__(self, connection: psycopg.Connection):
+        self.connection = connection
+
+    def __enter__(self) -> "PostgresConnection":
+        return self
+
+    def __exit__(self, exception_type: Any, exception: Any, traceback: Any) -> None:
+        if exception_type:
+            self.connection.rollback()
+        else:
+            self.connection.commit()
+        self.connection.close()
+
+    @staticmethod
+    def _query(query: str) -> str:
+        return query.replace("?", "%s")
+
+    def execute(self, query: str, parameters: Any = ()):
+        return self.connection.execute(self._query(query), parameters)
+
+    def executemany(self, query: str, parameters: Any):
+        return self.connection.executemany(self._query(query), parameters)
+
+
+def db() -> Any:
+    if DATABASE_URL:
+        return PostgresConnection(psycopg.connect(DATABASE_URL, row_factory=dict_row))
     connection = sqlite3.connect(DB_PATH, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -81,9 +111,10 @@ def db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not DATABASE_URL:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with db() as connection:
-        connection.executescript(
+        schema = (
             """
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,6 +180,10 @@ def init_db() -> None:
             );
             """
         )
+        if DATABASE_URL:
+            connection.execute(schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY"))
+        else:
+            connection.executescript(schema)
 
 
 def hash_password(password: str) -> str:
@@ -396,9 +431,9 @@ def root() -> dict[str, str]:
 def signup(payload: AuthPayload) -> dict[str, str]:
     with db() as connection:
         try:
-            cursor = connection.execute("INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)", (payload.email.lower(), hash_password(payload.password), now()))
-            user_id = cursor.lastrowid
-        except sqlite3.IntegrityError as error:
+            cursor = connection.execute("INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?) RETURNING id", (payload.email.lower(), hash_password(payload.password), now()))
+            user_id = cursor.fetchone()["id"]
+        except (sqlite3.IntegrityError, psycopg.errors.UniqueViolation) as error:
             raise HTTPException(status_code=409, detail="An account with that email already exists") from error
     seed_holdings(user_id)
     return {"token": token_for(user_id)}
@@ -426,8 +461,8 @@ def create_holding(payload: HoldingPayload, user_id: int = Depends(current_user)
         raise HTTPException(status_code=422, detail="asset_type must be stock, mf, gold, or debt")
     name, sector = DEFAULTS.get(ticker, (ticker, "Other"))
     with db() as connection:
-        cursor = connection.execute("INSERT INTO holdings (user_id, ticker, name, asset_type, sector, quantity, buy_price, last_price, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (user_id, ticker, name, asset_type, sector, payload.quantity, payload.buy_price, price_for(ticker, payload.buy_price), now()))
-        row = connection.execute("SELECT * FROM holdings WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        cursor = connection.execute("INSERT INTO holdings (user_id, ticker, name, asset_type, sector, quantity, buy_price, last_price, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id", (user_id, ticker, name, asset_type, sector, payload.quantity, payload.buy_price, price_for(ticker, payload.buy_price), now()))
+        row = connection.execute("SELECT * FROM holdings WHERE id = ?", (cursor.fetchone()["id"],)).fetchone()
     return holding_json(row)
 
 
@@ -455,8 +490,8 @@ async def import_csv(file: UploadFile = File(...), user_id: int = Depends(curren
             if asset_type not in ASSET_TYPES:
                 raise HTTPException(status_code=422, detail="asset_type must be stock, mf, gold, or debt")
             name, sector = DEFAULTS.get(ticker, (ticker, "Other"))
-            cursor = connection.execute("INSERT INTO holdings (user_id, ticker, name, asset_type, sector, quantity, buy_price, last_price, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (user_id, ticker, name, asset_type, sector, payload.quantity, payload.buy_price, price_for(ticker, payload.buy_price), now()))
-            created.append(holding_json(connection.execute("SELECT * FROM holdings WHERE id = ?", (cursor.lastrowid,)).fetchone()))
+            cursor = connection.execute("INSERT INTO holdings (user_id, ticker, name, asset_type, sector, quantity, buy_price, last_price, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id", (user_id, ticker, name, asset_type, sector, payload.quantity, payload.buy_price, price_for(ticker, payload.buy_price), now()))
+            created.append(holding_json(connection.execute("SELECT * FROM holdings WHERE id = ?", (cursor.fetchone()["id"],)).fetchone()))
     return created
 
 
@@ -497,8 +532,8 @@ def create_alert(payload: AlertPayload, user_id: int = Depends(current_user)) ->
     with db() as connection:
         if connection.execute("SELECT id FROM holdings WHERE id = ? AND user_id = ?", (payload.holding_id, user_id)).fetchone() is None:
             raise HTTPException(status_code=404, detail="Holding not found")
-        cursor = connection.execute("INSERT INTO alerts (user_id, holding_id, threshold_price, direction, created_at) VALUES (?, ?, ?, ?, ?)", (user_id, payload.holding_id, payload.threshold_price, payload.direction, now()))
-        row = connection.execute("SELECT * FROM alerts WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        cursor = connection.execute("INSERT INTO alerts (user_id, holding_id, threshold_price, direction, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id", (user_id, payload.holding_id, payload.threshold_price, payload.direction, now()))
+        row = connection.execute("SELECT * FROM alerts WHERE id = ?", (cursor.fetchone()["id"],)).fetchone()
     return dict(row)
 
 
@@ -529,12 +564,12 @@ def add_watchlist_item(payload: WatchlistPayload, user_id: int = Depends(current
         ensure_ticker_state(connection, ticker)
         try:
             cursor = connection.execute(
-                "INSERT INTO watchlist_items (user_id, ticker, added_at) VALUES (?, ?, ?)",
+                "INSERT INTO watchlist_items (user_id, ticker, added_at) VALUES (?, ?, ?) RETURNING id",
                 (user_id, ticker, now()),
             )
-        except sqlite3.IntegrityError as error:
+        except (sqlite3.IntegrityError, psycopg.errors.UniqueViolation) as error:
             raise HTTPException(status_code=409, detail="That ticker is already on your watchlist") from error
-        row = connection.execute("SELECT id, user_id, ticker, added_at FROM watchlist_items WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        row = connection.execute("SELECT id, user_id, ticker, added_at FROM watchlist_items WHERE id = ?", (cursor.fetchone()["id"],)).fetchone()
         return {**watchlist_item_json(row), "state": ticker_json(ensure_ticker_state(connection, ticker))}
 
 
