@@ -1,4 +1,4 @@
-# PulseFolio — Portfolio Health & Rebalancing Assistant (frontend)
+# PulseFolio — Portfolio Health, Rebalancing & Smart Watchlist
 
 PulseFolio ingests a retail investor's holdings (stocks, mutual funds, gold, debt) and shows,
 in near real time, how healthy and diversified the portfolio actually is:
@@ -11,20 +11,27 @@ in near real time, how healthy and diversified the portfolio actually is:
 - **Price alerts** (above/below) with real-time toast notifications over WebSocket
 - **Smart Watchlist** that ranks statistically unusual ticker changes since your last visit
 
-This repository now includes a local FastAPI backend in `backend/`. It uses SQLite by default,
-so you can run the complete app without provisioning a database. The frontend still talks to the
-backend through the same REST and WebSocket contract and can be pointed at a deployed API later.
+This repository contains the complete React frontend and FastAPI backend. Local development uses
+SQLite by default; the hosted deployment uses Neon PostgreSQL so accounts, holdings, alerts, and
+watchlists persist across redeployments.
+
+## Live Demo
+
+- Frontend: https://pulsefolio.renukaguruguntla.workers.dev
+- Repository: https://github.com/renukag77/PulseFolio
+- API health check: use the `/health` endpoint on the deployed Render API
 
 ## Tech stack
 
 | Layer      | Choice |
 | ---------- | ------ |
-| Framework  | React 19 + TypeScript on TanStack Start (Vite 7) |
+| Framework  | React 19 + TypeScript on TanStack Start |
 | Routing    | TanStack Router (file-based, in `src/routes`) |
 | Styling    | Tailwind CSS v4 + shadcn/ui components, semantic tokens in `src/styles.css` |
 | Charts     | Recharts |
 | Data       | TanStack React Query |
 | HTTP       | Axios instance that attaches the JWT bearer token from `localStorage` |
+| Backend    | FastAPI with SQLite locally or Neon PostgreSQL in production |
 | Realtime   | Native `WebSocket` to `/ws/live` and `/ws/watchlist` |
 | Toasts     | sonner |
 
@@ -59,8 +66,7 @@ Create a `.env` file at the project root:
 VITE_API_BASE_URL=http://localhost:8000
 ```
 
-In production (e.g. Vercel), set `VITE_API_BASE_URL` to your deployed backend URL, for example
-`https://pulsefolio-api.onrender.com`. The WebSocket URL is derived automatically by swapping
+In production, set `VITE_API_BASE_URL` to your deployed Render backend URL. The WebSocket URL is derived automatically by swapping
 `http` → `ws`, so `https://` becomes `wss://`.
 
 If the variable is unset, the app falls back to `http://localhost:8000`.
@@ -121,11 +127,37 @@ value and P&L itself, so `price_update` messages patch the table without a refet
 The WebSocket connection appends the JWT as a `?token=` query parameter (browsers cannot set
 headers on WebSocket handshakes) and auto-reconnects every 5s after a drop.
 
-For deployment, set `JWT_SECRET`, `DATABASE_PATH`, and `FRONTEND_ORIGIN` from
-`backend/.env.example` on the backend host. The included SQLite setup is intended for local
-development. For hosted deployment, set `DATABASE_URL` to your Neon PostgreSQL connection string
-and leave `DATABASE_PATH` unused; the backend creates the required tables on startup. Never commit
-the connection string to GitHub.
+For deployment, set these Render environment variables:
+
+```text
+DATABASE_URL=your-Neon-PostgreSQL-connection-string
+JWT_SECRET=your-long-random-secret
+FRONTEND_ORIGIN=https://pulsefolio.renukaguruguntla.workers.dev
+```
+
+Leave `DATABASE_PATH` unset in production. The backend creates the required Neon tables on startup.
+Never commit a database connection string or `.env` file to GitHub.
+
+## Deployment
+
+Backend on Render:
+
+```text
+Build: pip install -r backend/requirements.txt
+Start: uvicorn app.main:app --host 0.0.0.0 --port $PORT --app-dir backend
+```
+
+Frontend on Cloudflare Workers:
+
+```text
+Build: npm run build
+Deploy: npx wrangler deploy --config .output/server/wrangler.json
+Variable: VITE_API_BASE_URL=https://your-render-api.onrender.com
+```
+
+After deploying the frontend, set its exact URL in Render's `FRONTEND_ORIGIN` variable and redeploy
+the backend. Verify the backend with `/health`; a healthy hosted response includes
+`"database":"postgresql"`.
 
 ## Folder structure
 
