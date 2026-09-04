@@ -420,7 +420,12 @@ app.add_middleware(CORSMiddleware, allow_origins=FRONTEND_ORIGINS + ["http://loc
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    try:
+        with db() as connection:
+            connection.execute("SELECT 1").fetchone()
+        return {"status": "ok", "database": "postgresql" if DATABASE_URL else "sqlite"}
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="Database connection unavailable") from error
 
 
 @app.get("/")

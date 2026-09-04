@@ -1,8 +1,8 @@
 import axios from "axios";
 
 /** Single source of truth for the external FastAPI backend URL. */
-export const API_BASE_URL: string =
-  (import.meta.env["VITE_API_BASE_URL"] as string | undefined) ?? "http://localhost:8000";
+const configuredApiUrl = import.meta.env["VITE_API_BASE_URL"] as string | undefined;
+export const API_BASE_URL: string = (configuredApiUrl ?? "http://localhost:8000").replace(/\/+$/, "");
 
 export const TOKEN_KEY = "pulsefolio_token";
 
